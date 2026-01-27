@@ -1,28 +1,13 @@
-import { Controller, Post, Body, Get, Param, Delete } from '@nestjs/common';
+async findAll() {
+  return this.connectorModel.find().lean();
+}
 
-@Controller('connectors')
-export class ConnectorController {
-  constructor(
-    private readonly connectorService: ConnectorService,
-  ) {}
+async findOne(id: string) {
+  return this.connectorModel.findById(id).lean();
+}
 
-  @Post()
-  register(@Body() dto: CreateConnectorDto) {
-    return this.connectorService.register(dto);
-  }
-
-  @Get()
-  findAll() {
-    return this.connectorService.findAll();
-  }
-
-  @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.connectorService.findOne(id);
-  }
-
-  @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.connectorService.remove(id);
-  }
+async remove(id: string) {
+  await this.stateModel.deleteOne({ connectorId: id });
+  await this.connectorModel.deleteOne({ _id: id });
+  return { deleted: true };
 }
