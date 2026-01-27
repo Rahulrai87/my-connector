@@ -1,100 +1,26 @@
-import { GraphService } from './graph.service';
-import { parseSharePointUrl } from './sharepoint-url.util';
+export function parseSharePointUrl(siteUrl: string): {
+  siteBaseUrl: string;
+  folderPath?: string;
+} {
+  const url = new URL(siteUrl);
 
-@Injectable()
-export class ConnectorService {
-  constructor(
-    @InjectModel(Connector.name)
-    private readonly connectorModel: Model<Connector>,
+  const parts = url.pathname.split('/').filter(Boolean);
+  const sitesIndex = parts.indexOf('sites');
 
-    @InjectModel(ConnectorState.name)
-    private readonly stateModel: Model<ConnectorState>,
-
-    private readonly graph: GraphService,
-  ) {}
-
-  async register(dto: CreateConnectorDto) {
-    if (dto.type !== 'sharepoint') {
-      throw new BadRequestException(
-        'Only sharepoint connectors are supported',
-      );
-    }
-
-    // 1️⃣ Parse URL
-    let parsed;
-    try {
-      parsed = parseSharePointUrl(dto.siteUrl);
-    } catch (e: any) {
-      throw new BadRequestException(e.message);
-    }
-
-    // 2️⃣ Validate site exists in SharePoint
-    let siteId: string;
-    try {
-      siteId = await this.graph.getSiteId(parsed.siteBaseUrl);
-    } catch {
-      throw new BadRequestException(
-        'SharePoint site does not exist or is not accessible',
-      );
-    }
-
-    // 3️⃣ Validate drive exists
-    let driveId: string;
-    try {
-      driveId = await this.graph.getDriveId(siteId);
-    } catch {
-      throw new BadRequestException(
-        'Document library not found for this site',
-      );
-    }
-
-    // 4️⃣ Validate folder exists (if provided)
-    if (parsed.folderPath) {
-      const exists = await this.graph.folderExists(
-        driveId,
-        parsed.folderPath,
-      );
-
-      if (!exists) {
-        throw new BadRequestException(
-          'Folder does not exist in SharePoint site',
-        );
-      }
-    }
-
-    // 5️⃣ Prevent duplicates
-    const existing = await this.connectorModel.findOne({
-      siteUrl: dto.siteUrl,
-      type: dto.type,
-    });
-
-    if (existing) {
-      throw new BadRequestException(
-        'Connector already registered',
-      );
-    }
-
-    // 6️⃣ Persist connector
-    const connector = await this.connectorModel.create({
-      name: dto.name,
-      type: dto.type,
-      siteUrl: dto.siteUrl,
-      cronExpression: dto.cronExpression,
-    });
-
-    // 7️⃣ Initialize state
-    await this.stateModel.create({
-      connectorId: connector._id.toString(),
-      deltaBroken: false,
-    });
-
-    return {
-      id: connector._id,
-      name: connector.name,
-      type: connector.type,
-      siteUrl: connector.siteUrl,
-      resolvedSite: parsed.siteBaseUrl,
-      resolvedFolder: parsed.folderPath ?? null,
-    };
+  if (sitesIndex === -1 || parts.length < sitesIndex + 2) {
+    throw new Error('Invalid SharePoint site URL');
   }
+
+  // /sites/hr
+  const sitePath = parts.slice(0, sitesIndex + 2).join('/');
+
+  // Anything after site path is folder
+  const folderParts = parts.slice(sitesIndex + 2);
+
+  return {
+    siteBaseUrl: `${url.origin}/${sitePath}`,
+    folderPath: folderParts.length
+      ? `/${folderParts.join('/')}`
+      : undefined,
+  };
 }
