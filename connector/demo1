@@ -1,17 +1,28 @@
-// src/connector/dto/create-connector.dto.ts
-import { IsString, IsIn } from 'class-validator';
+import { Controller, Post, Body, Get, Param, Delete } from '@nestjs/common';
 
-export class CreateConnectorDto {
-  @IsString()
-  name: string;
+@Controller('connectors')
+export class ConnectorController {
+  constructor(
+    private readonly connectorService: ConnectorService,
+  ) {}
 
-  @IsString()
-  siteUrl: string;
+  @Post()
+  register(@Body() dto: CreateConnectorDto) {
+    return this.connectorService.register(dto);
+  }
 
-  @IsString()
-  cronExpression: string;
+  @Get()
+  findAll() {
+    return this.connectorService.findAll();
+  }
 
-  // For now we validate strictly
-  @IsIn(['sharepoint'])
-  type: string;
+  @Get(':id')
+  findOne(@Param('id') id: string) {
+    return this.connectorService.findOne(id);
+  }
+
+  @Delete(':id')
+  remove(@Param('id') id: string) {
+    return this.connectorService.remove(id);
+  }
 }
