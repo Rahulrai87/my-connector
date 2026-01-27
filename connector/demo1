@@ -1,13 +1,8 @@
-async findAll() {
-  return this.connectorModel.find().lean();
-}
-
-async findOne(id: string) {
-  return this.connectorModel.findById(id).lean();
-}
-
-async remove(id: string) {
-  await this.stateModel.deleteOne({ connectorId: id });
-  await this.connectorModel.deleteOne({ _id: id });
-  return { deleted: true };
-}
+curl -X POST http://localhost:3000/connectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "HR Site",
+    "type": "sharepoint",
+    "siteUrl": "https://tenant.sharepoint.com/sites/hr",
+    "cronExpression": "*/5 * * * *"
+  }'
