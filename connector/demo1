@@ -1,23 +1,12 @@
-async folderExists(
-  driveId: string,
-  folderPath: string, // e.g. "Invoices/2024/January"
-): Promise<boolean> {
-  try {
-    const normalizedPath = folderPath
-      .split('/')
-      .map(encodeURIComponent)
-      .join('/');
-
-    const item = await this.client
-      .api(`/drives/${driveId}/root:/${normalizedPath}`)
-      .select('id,folder')
-      .get();
-
-    return Boolean(item?.folder);
-  } catch (err: any) {
-    if (err?.statusCode === 404) {
-      return false;
-    }
-    throw err; // real error
-  }
+async testCredentials(): Promise<boolean> {
+try {
+await this.client.api('/organization').select('id,displayName').get();
+return true;
+} catch (err: any) {
+console.error('Graph credential test failed:', {
+status: err?.statusCode,
+message: err?.message,
+});
+return false;
+}
 }
