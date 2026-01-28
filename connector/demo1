@@ -4,21 +4,17 @@ import { ClientSecretCredential } from '@azure/identity';
 import 'isomorphic-fetch';
 
 @Injectable()
-export class GraphClientService {
-  private client: Client;
+export class GraphService {
+  private readonly client: Client;
 
   constructor() {
-    this.client = this.createClient();
-  }
-
-  private createClient(): Client {
     const credential = new ClientSecretCredential(
       process.env.SP_TENANT_ID!,
       process.env.SP_CLIENT_ID!,
       process.env.SP_CLIENT_SECRET!,
     );
 
-    return Client.initWithMiddleware({
+    this.client = Client.initWithMiddleware({
       authProvider: {
         getAccessToken: async () => {
           const token = await credential.getToken(
@@ -30,7 +26,45 @@ export class GraphClientService {
     });
   }
 
-  getClient(): Client {
-    return this.client;
+  /* -------------------- SITES -------------------- */
+
+  getSite(sitePath: string) {
+    return this.client.api(`/sites/${sitePath}`).get();
+  }
+
+  listDrives(siteId: string) {
+    return this.client.api(`/sites/${siteId}/drives`).get();
+  }
+
+  /* -------------------- FILES -------------------- */
+
+  listRootItems(driveId: string) {
+    return this.client
+      .api(`/drives/${driveId}/root/children`)
+      .select('id,name,eTag,lastModifiedDateTime,size,file,folder')
+      .get();
+  }
+
+  getItem(driveId: string, itemId: string) {
+    return this.client
+      .api(`/drives/${driveId}/items/${itemId}`)
+      .select('id,name,eTag,lastModifiedDateTime,size')
+      .get();
+  }
+
+  /* -------------------- DELTA (HINT ONLY) -------------------- */
+
+  getDelta(driveId: string, deltaLink?: string) {
+    const api = deltaLink
+      ? this.client.api(deltaLink)
+      : this.client.api(`/drives/${driveId}/root/delta`);
+
+    return api.get();
+  }
+
+  /* -------------------- CHANGE FINGERPRINT -------------------- */
+
+  computeFingerprint(item: any): string {
+    return `${item.id}:${item.eTag}:${item.lastModifiedDateTime}`;
   }
 }
