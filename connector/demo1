@@ -1,92 +1,16 @@
-import { Injectable } from '@nestjs/common';
-import { Client } from '@microsoft/microsoft-graph-client';
-import { ClientSecretCredential } from '@azure/identity';
-import 'isomorphic-fetch';
+async listModifiedFilesSince(
+  driveId: string,
+  sinceISOTime: string, // e.g. 2025-01-20T10:00:00Z
+): Promise<any[]> {
+  const response = await this.client
+    .api(`/drives/${driveId}/root/search(q='')`)
+    .filter(`lastModifiedDateTime ge ${sinceISOTime}`)
+    .select(
+      'id,name,eTag,lastModifiedDateTime,size,file,parentReference',
+    )
+    .get();
 
-@Injectable()
-export class GraphService {
-  private readonly client: Client;
-
-  constructor() {
-    const credential = new ClientSecretCredential(
-      process.env.SP_TENANT_ID!,
-      process.env.SP_CLIENT_ID!,
-      process.env.SP_CLIENT_SECRET!,
-    );
-
-    this.client = Client.initWithMiddleware({
-      authProvider: {
-        getAccessToken: async () => {
-          const token = await credential.getToken(
-            'https://graph.microsoft.com/.default',
-          );
-          return token.token;
-        },
-      },
-    });
-  }
-
-  /* -------------------------------------------------
-     1️⃣ Get Site ID
-     sitePath example:
-     "contoso.sharepoint.com:/sites/Engineering"
-  ------------------------------------------------- */
-  async getSiteId(sitePath: string): Promise<string> {
-    const site = await this.client.api(`/sites/${sitePath}`).get();
-    return site.id;
-  }
-
-  /* -------------------------------------------------
-     2️⃣ Get Drive ID (Document Library)
-     Usually first drive = "Documents"
-  ------------------------------------------------- */
-  async getDriveId(siteId: string, driveName = 'Documents'): Promise<string> {
-    const drives = await this.client.api(`/sites/${siteId}/drives`).get();
-
-    const drive = drives.value.find(
-      (d: any) => d.name === driveName,
-    );
-
-    if (!drive) {
-      throw new Error(`Drive '${driveName}' not found`);
-    }
-
-    return drive.id;
-  }
-
-  /* -------------------------------------------------
-     3️⃣ Get Modified Files (metadata only)
-     Uses delta as hint + fingerprint later
-  ------------------------------------------------- */
-  async getModifiedFiles(
-    driveId: string,
-    deltaLink?: string,
-  ): Promise<{ items: any[]; deltaLink?: string }> {
-    const response = deltaLink
-      ? await this.client.api(deltaLink).get()
-      : await this.client.api(`/drives/${driveId}/root/delta`).get();
-
-    const items = (response.value || []).filter(
-      (item: any) =>
-        item.file && !item.deleted, // files only
-    );
-
-    return {
-      items: items.map((item: any) => ({
-        id: item.id,
-        name: item.name,
-        eTag: item.eTag,
-        lastModifiedDateTime: item.lastModifiedDateTime,
-        size: item.size,
-      })),
-      deltaLink: response['@odata.deltaLink'],
-    };
-  }
-
-  /* -------------------------------------------------
-     4️⃣ Fingerprint (truth source)
-  ------------------------------------------------- */
-  computeFingerprint(item: any): string {
-    return `${item.id}:${item.eTag}:${item.lastModifiedDateTime}`;
-  }
+  return (response.value || []).filter(
+    (item: any) => item.file && !item.deleted,
+  );
 }
