@@ -1,12 +1,338 @@
-async testCredentials(): Promise<boolean> {
-try {
-await this.client.api('/organization').select('id,displayName').get();
-return true;
-} catch (err: any) {
-console.error('Graph credential test failed:', {
-status: err?.statusCode,
-message: err?.message,
-});
-return false;
-}
+// src/connector/graph.service.ts
+
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model, Types } from 'mongoose';
+
+import { Client } from '@microsoft/microsoft-graph-client';
+import { ClientSecretCredential } from '@azure/identity';
+import 'isomorphic-fetch';
+
+import { ConnectorSnapshot } from './schemas/connector-snapshot.schema';
+import { ConnectorRun } from './schemas/connector-run.schema';
+import { ConnectorState } from './schemas/connector-state.schema';
+
+@Injectable()
+export class GraphService {
+  private readonly logger = new Logger(GraphService.name);
+
+  // 🔑 IMPORTANT: property name is `client`
+  private readonly client: Client;
+
+  constructor(
+    @InjectModel(ConnectorSnapshot.name)
+    private readonly snapshotModel: Model<ConnectorSnapshot>,
+
+    @InjectModel(ConnectorRun.name)
+    private readonly runModel: Model<ConnectorRun>,
+
+    @InjectModel(ConnectorState.name)
+    private readonly stateModel: Model<ConnectorState>,
+  ) {
+    /**
+     * Microsoft-recommended auth
+     * Headers (Authorization, Accept) are injected automatically
+     */
+    const credential = new ClientSecretCredential(
+      process.env.AZURE_TENANT_ID!,
+      process.env.AZURE_CLIENT_ID!,
+      process.env.AZURE_CLIENT_SECRET!,
+    );
+
+    this.client = Client.initWithMiddleware({
+      authProvider: {
+        getAccessToken: async () => {
+          const token = await credential.getToken(
+            'https://graph.microsoft.com/.default',
+          );
+          return token!.token;
+        },
+      },
+    });
+  }
+
+  /* =====================================================
+     Utils
+  ===================================================== */
+
+  private normalizeETag(eTag?: string): string | null {
+    if (!eTag) return null;
+    return eTag.replace(/^"+|"+$/g, '').replace(/[{}]/g, '');
+  }
+
+  /* =====================================================
+     Connector-state lock (atomic)
+  ===================================================== */
+
+  private async acquireLock(connectorId: Types.ObjectId): Promise<boolean> {
+    const state = await this.stateModel.findOneAndUpdate(
+      { connectorId, running: false },
+      {
+        $set: {
+          running: true,
+          lastRunAt: new Date(),
+        },
+      },
+      { upsert: true, new: true },
+    );
+    return !!state;
+  }
+
+  private async releaseLock(
+    connectorId: Types.ObjectId,
+    success = false,
+  ) {
+    await this.stateModel.updateOne(
+      { connectorId },
+      {
+        $set: {
+          running: false, // ✅ as you required
+          ...(success ? { lastSuccessAt: new Date() } : {}),
+        },
+      },
+    );
+  }
+
+  /* =====================================================
+     Resolve site → drive → folder from URL
+  ===================================================== */
+
+  private async resolveFromUrl(siteUrl: string) {
+    const url = new URL(siteUrl);
+    const parts = url.pathname.split('/').filter(Boolean);
+
+    // example: /sites/HR/Shared Documents/Policies
+    const sitePath = `/${parts[0]}/${parts[1]}`;
+    const folderPath = decodeURIComponent(parts.slice(2).join('/'));
+
+    const site = await this.client
+      .api(`/sites/${url.hostname}:${sitePath}`)
+      .get();
+
+    const drive = await this.client
+      .api(`/sites/${site.id}/drive`)
+      .get();
+
+    const folder = await this.client
+      .api(`/drives/${drive.id}/root:/${folderPath}`)
+      .get();
+
+    return {
+      driveId: drive.id,
+      folderId: folder.id,
+    };
+  }
+
+  /* =====================================================
+     Recursive folder walk
+  ===================================================== */
+
+  private async walkFolder(
+    driveId: string,
+    folderId: string,
+    parentPath = '',
+  ): Promise<
+    {
+      fileId: string;
+      eTag: string | null;
+      path: string;
+      lastModified: string;
+    }[]
+  > {
+    const files = [];
+
+    let res = await this.client
+      .api(`/drives/${driveId}/items/${folderId}/children`)
+      .top(200)
+      .get();
+
+    while (true) {
+      for (const item of res.value) {
+        const fullPath = `${parentPath}/${item.name}`;
+
+        if (item.folder) {
+          files.push(
+            ...(await this.walkFolder(driveId, item.id, fullPath)),
+          );
+        }
+
+        if (item.file) {
+          files.push({
+            fileId: item.id,
+            eTag: this.normalizeETag(item.eTag),
+            path: fullPath,
+            lastModified: item.lastModifiedDateTime,
+          });
+        }
+      }
+
+      if (!res['@odata.nextLink']) break;
+      res = await this.client.api(res['@odata.nextLink']).get();
+    }
+
+    return files;
+  }
+
+  /* =====================================================
+     MAIN SYNC METHOD (CALL THIS)
+  ===================================================== */
+
+  async runSync(
+    connectorId: string,
+    siteUrl: string,
+  ) {
+    const connectorObjectId = new Types.ObjectId(connectorId);
+    const startTime = Date.now();
+    let run: ConnectorRun | null = null;
+
+    const locked = await this.acquireLock(connectorObjectId);
+    if (!locked) {
+      return {
+        success: false,
+        message: 'Connector already running',
+      };
+    }
+
+    try {
+      run = await this.runModel.create({
+        connectorId: connectorObjectId,
+        startedAt: new Date(),
+        status: 'RUNNING',
+      });
+
+      // 1️⃣ Resolve target
+      const { driveId, folderId } =
+        await this.resolveFromUrl(siteUrl);
+
+      // 2️⃣ Scan SharePoint
+      const graphFiles = await this.walkFolder(
+        driveId,
+        folderId,
+      );
+
+      // 3️⃣ Load snapshot
+      const dbFiles = await this.snapshotModel.find({
+        connectorId: connectorObjectId,
+      });
+
+      const dbMap = new Map(dbFiles.map(f => [f.fileId, f]));
+      const graphMap = new Map(graphFiles.map(f => [f.fileId, f]));
+
+      const created = [];
+      const updated = [];
+      const deleted = [];
+
+      // CREATED + UPDATED
+      for (const g of graphFiles) {
+        const db = dbMap.get(g.fileId);
+        if (!db) {
+          created.push({
+            fileId: g.fileId,
+            eTag: g.eTag,
+            filePath: g.path,
+          });
+        } else if (db.eTag !== g.eTag) {
+          updated.push({
+            fileId: g.fileId,
+            eTag: g.eTag,
+            filePath: g.path,
+          });
+        }
+      }
+
+      // DELETED
+      for (const d of dbFiles) {
+        if (!graphMap.has(d.fileId)) {
+          deleted.push({
+            fileId: d.fileId,
+            eTag: d.eTag,
+            filePath: d.path,
+          });
+        }
+      }
+
+      // Apply snapshot changes
+      const ops = [...created, ...updated].map(f => ({
+        updateOne: {
+          filter: {
+            connectorId: connectorObjectId,
+            fileId: f.fileId,
+          },
+          update: {
+            $set: {
+              connectorId: connectorObjectId,
+              fileId: f.fileId,
+              eTag: f.eTag,
+              path: f.filePath,
+            },
+          },
+          upsert: true,
+        },
+      }));
+
+      if (ops.length) {
+        await this.snapshotModel.bulkWrite(ops);
+      }
+
+      if (deleted.length) {
+        await this.snapshotModel.deleteMany({
+          connectorId: connectorObjectId,
+          fileId: { $in: deleted.map(d => d.fileId) },
+        });
+      }
+
+      const durationMs = Date.now() - startTime;
+
+      await this.runModel.updateOne(
+        { _id: run._id },
+        {
+          status: 'SUCCESS',
+          finishedAt: new Date(),
+          durationMs,
+          created: created.length,
+          updated: updated.length,
+          deleted: deleted.length,
+        },
+      );
+
+      return {
+        success: true,
+        runId: run._id,
+        durationMs,
+        counts: {
+          created: created.length,
+          updated: updated.length,
+          deleted: deleted.length,
+        },
+        created,
+        updated,
+        deleted,
+      };
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unknown error';
+
+      if (run) {
+        await this.runModel.updateOne(
+          { _id: run._id },
+          {
+            status: 'FAILED',
+            finishedAt: new Date(),
+            error: message,
+          },
+        );
+      }
+
+      this.logger.error(message);
+
+      return {
+        success: false,
+        message: 'Sync failed',
+        error: message,
+      };
+    } finally {
+      // 🔓 ALWAYS unlock
+      await this.releaseLock(connectorObjectId);
+    }
+  }
 }
