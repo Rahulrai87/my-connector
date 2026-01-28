@@ -1,13 +1,36 @@
-// src/connector/utils/cron.util.ts
-import { CronJob } from 'cron';
+import { Injectable } from '@nestjs/common';
+import { Client } from '@microsoft/microsoft-graph-client';
+import { ClientSecretCredential } from '@azure/identity';
+import 'isomorphic-fetch';
 
-export function isValidCron(expr: string): boolean {
-  if (!expr || typeof expr !== 'string') return false;
+@Injectable()
+export class GraphClientService {
+  private client: Client;
 
-  try {
-    new CronJob(expr, () => {});
-    return true;
-  } catch {
-    return false;
+  constructor() {
+    this.client = this.createClient();
+  }
+
+  private createClient(): Client {
+    const credential = new ClientSecretCredential(
+      process.env.SP_TENANT_ID!,
+      process.env.SP_CLIENT_ID!,
+      process.env.SP_CLIENT_SECRET!,
+    );
+
+    return Client.initWithMiddleware({
+      authProvider: {
+        getAccessToken: async () => {
+          const token = await credential.getToken(
+            'https://graph.microsoft.com/.default',
+          );
+          return token.token;
+        },
+      },
+    });
+  }
+
+  getClient(): Client {
+    return this.client;
   }
 }
