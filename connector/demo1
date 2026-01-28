@@ -1,16 +1,31 @@
-async listModifiedFilesSince(
+async folderExists(
   driveId: string,
-  sinceISOTime: string, // e.g. 2025-01-20T10:00:00Z
-): Promise<any[]> {
-  const response = await this.client
-    .api(`/drives/${driveId}/root/search(q='')`)
-    .filter(`lastModifiedDateTime ge ${sinceISOTime}`)
-    .select(
-      'id,name,eTag,lastModifiedDateTime,size,file,parentReference',
-    )
-    .get();
+  folderPath: string, // e.g. "Invoices/2024/January"
+): Promise<{ exists: boolean; folder?: any }> {
+  try {
+    // Graph requires colon-wrapped path
+    const normalizedPath = folderPath
+      .split('/')
+      .map(encodeURIComponent)
+      .join('/');
 
-  return (response.value || []).filter(
-    (item: any) => item.file && !item.deleted,
-  );
+    const item = await this.client
+      .api(`/drives/${driveId}/root:/${normalizedPath}`)
+      .select('id,name,folder,parentReference,lastModifiedDateTime')
+      .get();
+
+    // Exists AND is a folder
+    if (item.folder) {
+      return { exists: true, folder: item };
+    }
+
+    return { exists: false };
+  } catch (err: any) {
+    // Graph returns 404 if path doesn't exist
+    if (err?.statusCode === 404) {
+      return { exists: false };
+    }
+
+    throw err; // real error
+  }
 }
