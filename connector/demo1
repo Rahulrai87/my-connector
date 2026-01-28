@@ -1,9 +1,8 @@
 async folderExists(
   driveId: string,
   folderPath: string, // e.g. "Invoices/2024/January"
-): Promise<{ exists: boolean; folder?: any }> {
+): Promise<boolean> {
   try {
-    // Graph requires colon-wrapped path
     const normalizedPath = folderPath
       .split('/')
       .map(encodeURIComponent)
@@ -11,21 +10,14 @@ async folderExists(
 
     const item = await this.client
       .api(`/drives/${driveId}/root:/${normalizedPath}`)
-      .select('id,name,folder,parentReference,lastModifiedDateTime')
+      .select('id,folder')
       .get();
 
-    // Exists AND is a folder
-    if (item.folder) {
-      return { exists: true, folder: item };
-    }
-
-    return { exists: false };
+    return Boolean(item?.folder);
   } catch (err: any) {
-    // Graph returns 404 if path doesn't exist
     if (err?.statusCode === 404) {
-      return { exists: false };
+      return false;
     }
-
     throw err; // real error
   }
 }
