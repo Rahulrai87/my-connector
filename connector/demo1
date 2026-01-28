@@ -1,14 +1,71 @@
-async listModifiedFiles(
-  driveId: string,
-  since?: Date,
-) {
-  const filter = since
-    ? `&$filter=lastModifiedDateTime gt ${since.toISOString()}`
-    : '';
+import { Injectable } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 
-  const res = await this.api(
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/root/children?$top=999${filter}`,
-  );
+@Injectable()
+export class ConnectorRunner {
+  constructor(
+    private readonly graph: GraphService,
 
-  return res.data.value;
+    @InjectModel(Connector.name)
+    private readonly connectorModel: Model<Connector>,
+
+    @InjectModel(ConnectorState.name)
+    private readonly stateModel: Model<ConnectorState>,
+
+    @InjectModel(ConnectorSnapshot.name)
+    private readonly snapshotModel: Model<ConnectorSnapshot>,
+  ) {}
+
+  /**
+   * Incremental scan logic:
+   * - First run → full scan
+   * - Next runs → lastModifiedDateTime > lastScannedAt
+   */
+  async run(connectorId: string) {
+    const connector =
+      await this.connectorModel.findById(connectorId);
+    if (!connector) return;
+
+    const state =
+      await this.stateModel.findOne({ connectorId });
+
+    const since = state?.lastScannedAt;
+
+    const { siteBaseUrl } =
+      parseSharePointUrl(connector.siteUrl);
+
+    const siteId = await this.graph.getSiteId(siteBaseUrl);
+    const driveId = await this.graph.getDriveId(siteId);
+
+    // Fetch files (all on first run, incremental after)
+    const files =
+      await this.graph.listModifiedFiles(driveId, since);
+
+    for (const item of files) {
+      if (!item.file) continue;
+
+      // Insert or update
+      await this.snapshotModel.updateOne(
+        { connectorId, fileId: item.id },
+        {
+          $set: {
+            fileName: item.name,
+            eTag: item.eTag,
+            lastModified: new Date(
+              item.lastModifiedDateTime,
+            ),
+          },
+        },
+        { upsert: true },
+      );
+    }
+
+    // Update checkpoint ONLY after successful scan
+    await this.stateModel.updateOne(
+      { connectorId },
+      { lastScannedAt: new Date() },
+      { upsert: true },
+    );
+  }
 }
