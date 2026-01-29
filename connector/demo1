@@ -1,15 +1,137 @@
-@Post(':id/run')
-async runConnector(@Param('id') connectorId: string) {
-const connector = await this.connectorModel.findById(connectorId);
+async syncSharePointConnector(
+  params: {
+    connectorId: string;
+    siteId: string;
+  },
+): Promise<{
+  created: SnapshotDoc[];
+  updated: SnapshotDoc[];
+  deleted: SnapshotDoc[];
+}> {
+  const { connectorId, siteId } = params;
 
+  /* ===============================
+     1. Get Drive (default library)
+     =============================== */
+  const drive = await this.graphClient
+    .api(`/sites/${siteId}/drive`)
+    .get();
 
-if (!connector) {
-throw new NotFoundException('Connector not found');
-}
+  const driveId = drive.id;
 
+  /* ===============================
+     2. Load DB snapshot
+     =============================== */
+  const dbDocs: SnapshotDoc[] =
+    await this.snapshotModel.find({ connectorId }).lean();
 
-return this.graphService.runSync(
-connector._id.toString(),
-connector.siteUrl,
-);
+  const dbMap = new Map<string, SnapshotDoc>();
+  for (const d of dbDocs) {
+    dbMap.set(d.fileId, d);
+  }
+
+  /* ===============================
+     3. Crawl SharePoint recursively
+     =============================== */
+  const liveDocs: SnapshotDoc[] = [];
+  const liveMap = new Map<string, SnapshotDoc>();
+
+  const queue: string[] = ['root'];
+
+  while (queue.length) {
+    const itemId = queue.shift()!;
+
+    let res;
+    try {
+      res = await this.graphClient
+        .api(
+          itemId === 'root'
+            ? `/drives/${driveId}/root/children`
+            : `/drives/${driveId}/items/${itemId}/children`,
+        )
+        .get();
+    } catch (e) {
+      // permission / transient error → skip subtree
+      continue;
+    }
+
+    for (const item of res.value) {
+      const doc: SnapshotDoc = {
+        connectorId,
+        fileId: item.id,
+        path: `${item.parentReference?.path}/${item.name}`,
+        eTag: item.eTag,
+        lastModified: item.lastModifiedDateTime,
+        size: item.size ?? 0,
+        isFolder: !!item.folder,
+      };
+
+      liveDocs.push(doc);
+      liveMap.set(doc.fileId, doc);
+
+      if (item.folder) {
+        queue.push(item.id);
+      }
+    }
+  }
+
+  /* ===============================
+     4. Diff
+     =============================== */
+
+  // Created
+  const created = liveDocs.filter(
+    d => !dbMap.has(d.fileId),
+  );
+
+  // Deleted
+  const deleted = dbDocs.filter(
+    d => !liveMap.has(d.fileId),
+  );
+
+  // Updated
+  const updated = liveDocs.filter(live => {
+    const db = dbMap.get(live.fileId);
+    if (!db) return false;
+
+    return (
+      db.eTag !== live.eTag ||
+      db.path !== live.path ||
+      db.lastModified !== live.lastModified
+    );
+  });
+
+  /* ===============================
+     5. Persist changes (SAFE ORDER)
+     =============================== */
+
+  // 1. Deleted
+  if (deleted.length) {
+    await this.snapshotModel.deleteMany({
+      connectorId,
+      fileId: { $in: deleted.map(d => d.fileId) },
+    });
+  }
+
+  // 2. Updated
+  for (const doc of updated) {
+    await this.snapshotModel.updateOne(
+      { connectorId, fileId: doc.fileId },
+      { $set: doc },
+    );
+  }
+
+  // 3. Created
+  if (created.length) {
+    await this.snapshotModel.insertMany(created);
+  }
+
+  /* ===============================
+     6. Return diff
+     =============================== */
+  return {
+    created,
+    updated,
+    deleted,
+  };
 }
