@@ -1,137 +1,144 @@
-async syncSharePointConnector(
-  params: {
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { Client } from '@microsoft/microsoft-graph-client';
+
+@Injectable()
+export class SharePointSyncService {
+  private readonly logger = new Logger(SharePointSyncService.name);
+
+  constructor(
+    @InjectModel('SharePointFile')
+    private readonly fileModel: Model<any>,
+    private readonly graphClient: Client, // injected graph client
+  ) {}
+
+  /* ============================================================
+     PUBLIC API
+     ============================================================ */
+
+  async nextSync(params: {
     connectorId: string;
     siteId: string;
-  },
-): Promise<{
-  created: SnapshotDoc[];
-  updated: SnapshotDoc[];
-  deleted: SnapshotDoc[];
-}> {
-  const { connectorId, siteId } = params;
+    listId: string;
+    rootItemId: string;
+  }) {
+    const { connectorId, siteId, listId, rootItemId } = params;
 
-  /* ===============================
-     1. Get Drive (default library)
-     =============================== */
-  const drive = await this.graphClient
-    .api(`/sites/${siteId}/drive`)
-    .get();
+    // 1️⃣ Fetch SharePoint metadata
+    const spItems = await this.fetchAllFromSharePoint(
+      siteId,
+      listId,
+      rootItemId,
+    );
 
-  const driveId = drive.id;
+    // 2️⃣ Fetch DB metadata
+    const dbItems = await this.fetchAllFromDb(connectorId);
 
-  /* ===============================
-     2. Load DB snapshot
-     =============================== */
-  const dbDocs: SnapshotDoc[] =
-    await this.snapshotModel.find({ connectorId }).lean();
-
-  const dbMap = new Map<string, SnapshotDoc>();
-  for (const d of dbDocs) {
-    dbMap.set(d.fileId, d);
+    // 3️⃣ Diff
+    return this.diff(spItems, dbItems);
   }
 
-  /* ===============================
-     3. Crawl SharePoint recursively
-     =============================== */
-  const liveDocs: SnapshotDoc[] = [];
-  const liveMap = new Map<string, SnapshotDoc>();
+  /* ============================================================
+     SHAREPOINT FETCH
+     ============================================================ */
 
-  const queue: string[] = ['root'];
+  private async fetchAllFromSharePoint(
+    siteId: string,
+    listId: string,
+    rootItemId: string,
+  ) {
+    // Resolve driveId from list
+    const drive = await this.graphClient
+      .api(`/sites/${siteId}/lists/${listId}/drive`)
+      .get();
 
-  while (queue.length) {
-    const itemId = queue.shift()!;
+    const driveId = drive.id;
+    const result: any[] = [];
 
-    let res;
-    try {
-      res = await this.graphClient
-        .api(
-          itemId === 'root'
-            ? `/drives/${driveId}/root/children`
-            : `/drives/${driveId}/items/${itemId}/children`,
-        )
-        .get();
-    } catch (e) {
-      // permission / transient error → skip subtree
-      continue;
-    }
+    await this.walkRecursive(driveId, rootItemId, '', result);
+
+    return result;
+  }
+
+  private async walkRecursive(
+    driveId: string,
+    itemId: string,
+    basePath: string,
+    out: any[],
+  ) {
+    const res = await this.graphClient
+      .api(`/drives/${driveId}/items/${itemId}/children`)
+      .get();
 
     for (const item of res.value) {
-      const doc: SnapshotDoc = {
-        connectorId,
-        fileId: item.id,
-        path: `${item.parentReference?.path}/${item.name}`,
-        eTag: item.eTag,
-        lastModified: item.lastModifiedDateTime,
-        size: item.size ?? 0,
-        isFolder: !!item.folder,
-      };
+      const path = `${basePath}/${item.name}`;
 
-      liveDocs.push(doc);
-      liveMap.set(doc.fileId, doc);
+      out.push({
+        itemId: item.id,
+        name: item.name,
+        path,
+        eTag: item.eTag,
+        isFolder: !!item.folder,
+        lastModifiedDateTime: item.lastModifiedDateTime,
+      });
 
       if (item.folder) {
-        queue.push(item.id);
+        await this.walkRecursive(driveId, item.id, path, out);
       }
     }
   }
 
-  /* ===============================
-     4. Diff
-     =============================== */
+  /* ============================================================
+     DB FETCH
+     ============================================================ */
 
-  // Created
-  const created = liveDocs.filter(
-    d => !dbMap.has(d.fileId),
-  );
-
-  // Deleted
-  const deleted = dbDocs.filter(
-    d => !liveMap.has(d.fileId),
-  );
-
-  // Updated
-  const updated = liveDocs.filter(live => {
-    const db = dbMap.get(live.fileId);
-    if (!db) return false;
-
-    return (
-      db.eTag !== live.eTag ||
-      db.path !== live.path ||
-      db.lastModified !== live.lastModified
-    );
-  });
-
-  /* ===============================
-     5. Persist changes (SAFE ORDER)
-     =============================== */
-
-  // 1. Deleted
-  if (deleted.length) {
-    await this.snapshotModel.deleteMany({
-      connectorId,
-      fileId: { $in: deleted.map(d => d.fileId) },
-    });
+  private async fetchAllFromDb(connectorId: string) {
+    return this.fileModel
+      .find({ connectorId })
+      .lean();
   }
 
-  // 2. Updated
-  for (const doc of updated) {
-    await this.snapshotModel.updateOne(
-      { connectorId, fileId: doc.fileId },
-      { $set: doc },
-    );
-  }
+  /* ============================================================
+     DIFF ENGINE
+     ============================================================ */
 
-  // 3. Created
-  if (created.length) {
-    await this.snapshotModel.insertMany(created);
-  }
+  private diff(spItems: any[], dbItems: any[]) {
+    const spMap = new Map<string, any>();
+    const dbMap = new Map<string, any>();
 
-  /* ===============================
-     6. Return diff
-     =============================== */
-  return {
-    created,
-    updated,
-    deleted,
-  };
+    spItems.forEach(i => spMap.set(i.itemId, i));
+    dbItems.forEach(i => dbMap.set(i.itemId, i));
+
+    const created: any[] = [];
+    const updated: any[] = [];
+    const deleted: any[] = [];
+
+    // Created / Updated
+    for (const [itemId, spItem] of spMap) {
+      const dbItem = dbMap.get(itemId);
+
+      if (!dbItem) {
+        created.push(spItem);
+        continue;
+      }
+
+      if (dbItem.eTag !== spItem.eTag) {
+        updated.push(spItem);
+      }
+    }
+
+    // Deleted
+    for (const [itemId, dbItem] of dbMap) {
+      if (!spMap.has(itemId)) {
+        deleted.push(dbItem);
+      }
+    }
+
+    return {
+      created,
+      updated,
+      deleted,
+    };
+  }
 }
