@@ -1,7 +1,35 @@
+// sharepoint-sync.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Client } from '@microsoft/microsoft-graph-client';
+
+/* ================= ALLOWED FILE TYPES ================= */
+
+const ALLOWED_EXTENSIONS = new Set([
+  'txt',
+  'md',
+  'csv',
+  'json',
+  'xml',
+  'html',
+  'htm',
+  'pdf',
+  'doc',
+  'docx',
+  'ppt',
+  'pptx',
+  'xls',
+  'xlsx',
+]);
+
+interface RuntimeSpItem {
+  fileId: string;
+  eTag: string;
+  filePath: string;
+  fileName: string;
+  lastModifiedDateTime: string;
+}
 
 @Injectable()
 export class SharePointSyncService {
@@ -9,32 +37,40 @@ export class SharePointSyncService {
 
   constructor(
     @InjectModel('SharePointFile')
-    private readonly spFileModel: Model<any>,
+    private readonly fileModel: Model<any>,
     private readonly graphClient: Client,
   ) {}
 
   /* =====================================================
-     PUBLIC ENTRY
+     PUBLIC ENTRY – CALLED BY SCHEDULER
      ===================================================== */
 
-  async nextSync(
+  async sync(
     connectorId: string,
     siteId: string,
     listId: string,
     rootItemId: string,
   ) {
-    // 1️⃣ Fetch SharePoint → array
+    // 1️⃣ Fetch SharePoint state
     const spItems = await this.fetchAllFromSharePoint(
       siteId,
       listId,
       rootItemId,
     );
 
-    // 2️⃣ Fetch DB → array
-    const dbItems = await this.fetchAllFromDb(connectorId);
+    // 2️⃣ Fetch DB state
+    const dbItems = await this.fileModel
+      .find({ connectorId })
+      .lean();
 
-    // 3️⃣ Compare
-    return this.diff(spItems, dbItems);
+    // 3️⃣ Diff
+    const diff = this.diff(spItems, dbItems);
+
+    // 4️⃣ Apply DB mutations
+    await this.applyDbChanges(connectorId, diff);
+
+    // 5️⃣ Return for Kafka later
+    return diff;
   }
 
   /* =====================================================
@@ -45,24 +81,21 @@ export class SharePointSyncService {
     siteId: string,
     listId: string,
     rootItemId: string,
-  ) {
-    // Resolve driveId from list
+  ): Promise<RuntimeSpItem[]> {
     const drive = await this.graphClient
       .api(`/sites/${siteId}/lists/${listId}/drive`)
       .get();
 
-    const driveId = drive.id;
-    const result: any[] = [];
-
-    await this.walkRecursive(driveId, rootItemId, '', result);
+    const result: RuntimeSpItem[] = [];
+    await this.walk(drive.id, rootItemId, '', result);
     return result;
   }
 
-  private async walkRecursive(
+  private async walk(
     driveId: string,
     itemId: string,
     basePath: string,
-    out: any[],
+    out: RuntimeSpItem[],
   ) {
     const res = await this.graphClient
       .api(`/drives/${driveId}/items/${itemId}/children`)
@@ -71,86 +104,114 @@ export class SharePointSyncService {
     for (const item of res.value) {
       const filePath = `${basePath}/${item.name}`;
 
+      /* ----------- FOLDER: recurse only ----------- */
+      if (item.folder) {
+        await this.walk(driveId, item.id, filePath, out);
+        continue;
+      }
+
+      /* ----------- FILE FILTERING ----------- */
+      if (!item.file) continue;
+      if (!this.isTextableFile(item.name)) continue;
+
       out.push({
-        itemId: item.id, // runtime only
+        fileId: item.id,
         eTag: item.eTag,
         fileName: item.name,
         filePath,
         lastModifiedDateTime: item.lastModifiedDateTime,
       });
-
-      if (item.folder) {
-        await this.walkRecursive(
-          driveId,
-          item.id,
-          filePath,
-          out,
-        );
-      }
     }
   }
 
-  /* =====================================================
-     DB FETCH
-     ===================================================== */
-
-  private async fetchAllFromDb(connectorId: string) {
-    return this.spFileModel
-      .find({ connectorId })
-      .lean();
+  private isTextableFile(fileName: string): boolean {
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    return !!ext && ALLOWED_EXTENSIONS.has(ext);
   }
 
   /* =====================================================
-     DIFF ENGINE
+     DIFF ENGINE (fileId + eTag)
      ===================================================== */
 
-  private diff(spItems: any[], dbItems: any[]) {
-    /**
-     * DB schema:
-     * connectorId, eTag, filePath, fileName, lastModifiedDateTime
-     *
-     * Identity = filePath
-     * Update detection = eTag OR lastModifiedDateTime
-     */
-
-    const spMap = new Map<string, any>();
+  private diff(spItems: RuntimeSpItem[], dbItems: any[]) {
+    const spMap = new Map<string, RuntimeSpItem>();
     const dbMap = new Map<string, any>();
 
-    spItems.forEach(i => spMap.set(i.filePath, i));
-    dbItems.forEach(i => dbMap.set(i.filePath, i));
+    spItems.forEach(i => spMap.set(i.fileId, i));
+    dbItems.forEach(i => dbMap.set(i.fileId, i));
 
-    const created: any[] = [];
-    const updated: any[] = [];
+    const created: RuntimeSpItem[] = [];
+    const updated: RuntimeSpItem[] = [];
     const deleted: any[] = [];
 
-    // Created / Updated
-    for (const [filePath, spItem] of spMap) {
-      const dbItem = dbMap.get(filePath);
+    // Created & Updated
+    for (const [fileId, spItem] of spMap) {
+      const dbItem = dbMap.get(fileId);
 
       if (!dbItem) {
         created.push(spItem);
         continue;
       }
 
-      if (
-        dbItem.eTag !== spItem.eTag ||
-        dbItem.lastModifiedDateTime !== spItem.lastModifiedDateTime
-      ) {
+      if (dbItem.eTag !== spItem.eTag) {
         updated.push(spItem);
       }
     }
 
     // Deleted
-    for (const [filePath, dbItem] of dbMap) {
-      if (!spMap.has(filePath)) {
+    for (const [fileId, dbItem] of dbMap) {
+      if (!spMap.has(fileId)) {
         deleted.push(dbItem);
       }
     }
 
-    return {
-      created,
-      updated,
-      deleted,
-    };
+    return { created, updated, deleted };
+  }
+
+  /* =====================================================
+     APPLY DB CHANGES
+     ===================================================== */
+
+  private async applyDbChanges(
+    connectorId: string,
+    diff: {
+      created: RuntimeSpItem[];
+      updated: RuntimeSpItem[];
+      deleted: any[];
+    },
+  ) {
+    /* INSERT */
+    if (diff.created.length) {
+      await this.fileModel.insertMany(
+        diff.created.map(f => ({
+          connectorId,
+          ...f,
+        })),
+        { ordered: false },
+      );
+    }
+
+    /* UPDATE */
+    for (const f of diff.updated) {
+      await this.fileModel.updateOne(
+        { connectorId, fileId: f.fileId },
+        {
+          $set: {
+            eTag: f.eTag,
+            filePath: f.filePath,
+            fileName: f.fileName,
+            lastModifiedDateTime: f.lastModifiedDateTime,
+          },
+        },
+      );
+    }
+
+    /* DELETE */
+    if (diff.deleted.length) {
+      await this.fileModel.deleteMany({
+        connectorId,
+        fileId: { $in: diff.deleted.map(d => d.fileId) },
+      });
+    }
   }
 }
