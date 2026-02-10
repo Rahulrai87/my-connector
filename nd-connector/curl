@@ -1,0 +1,31 @@
+curl -X POST http://localhost:3000/modules \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Finance",
+    "description": "Finance documents module"
+  }'
+
+
+curl -X POST http://localhost:3000/regions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "ap-south-1",
+    "name": "India"
+  }'
+
+
+curl -X POST http://localhost:3000/nd-connectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "appName": "Legal Docs",
+    "cronExpression": "*/5 * * * *",
+    "folderId": "SHAREPOINT_FOLDER_ID",
+    "acceptedExtensions": ["pdf", "docx"],
+    "maxSizeInMB": 10,
+    "moduleId": "<MODULE_ID>",
+    "regionId": "<REGION_ID>",
+    "typeId": {
+      "siteId": "SHAREPOINT_SITE_ID",
+      "driveId": "SHAREPOINT_DRIVE_ID"
+    }
+  }'
