@@ -41,28 +41,44 @@ export class SharePointGraphService {
   }
 
   // =====================================================
-  // MAIN ENTRY METHOD
+  // MAIN ENTRY (WITH lastRunAt CONDITION)
   // =====================================================
-  async syncFilesBasedOnLastRun(
+  async syncFiles(
     siteId: string,
     listId: string,
-    rootFolderId: string, // driveItem.id of folder
+    rootFolderId: string,
     lastRunAt: Date | null,
     acceptedExtensions: string[],
   ): Promise<SharePointFileMeta[]> {
 
-    const driveId = await this.getDriveId(siteId, listId);
+    try {
+      const driveId = await this.getDriveId(siteId, listId);
+      const normalizedExt = this.normalizeExtensions(acceptedExtensions);
 
-    const normalizedExtensions =
-      this.normalizeExtensions(acceptedExtensions);
+      // FULL SYNC
+      if (!lastRunAt) {
+        return await this.fetchRecursively(
+          siteId,
+          driveId,
+          rootFolderId,
+          null,
+          normalizedExt,
+        );
+      }
 
-    return this.fetchFilesRecursivelyFromFolder(
-      siteId,
-      driveId,
-      rootFolderId,
-      lastRunAt,
-      normalizedExtensions,
-    );
+      // INCREMENTAL SYNC
+      return await this.fetchRecursively(
+        siteId,
+        driveId,
+        rootFolderId,
+        lastRunAt,
+        normalizedExt,
+      );
+
+    } catch (error) {
+      console.error("Sync failed:", error);
+      return []; // never break server
+    }
   }
 
   // =====================================================
@@ -73,17 +89,23 @@ export class SharePointGraphService {
     listId: string,
   ): Promise<string> {
 
-    const drive = await this.client
-      .api(`/sites/${siteId}/lists/${listId}/drive`)
-      .get();
+    const response = await this.safeApiCall(() =>
+      this.client
+        .api(`/sites/${siteId}/lists/${listId}/drive`)
+        .get()
+    );
 
-    return drive.id;
+    if (!response?.id) {
+      throw new Error("Drive not found for list");
+    }
+
+    return response.id;
   }
 
   // =====================================================
-  // RECURSIVE TRAVERSAL FROM FOLDER ID
+  // RECURSIVE FETCH (FULL OR INCREMENTAL)
   // =====================================================
-  private async fetchFilesRecursivelyFromFolder(
+  private async fetchRecursively(
     siteId: string,
     driveId: string,
     rootFolderId: string,
@@ -97,40 +119,53 @@ export class SharePointGraphService {
 
     while (stack.length > 0) {
 
-      const currentFolderId = stack.pop()!;
+      const folderId = stack.pop()!;
 
-      let response = await this.client
-        .api(`/sites/${siteId}/drives/${driveId}/items/${currentFolderId}/children`)
-        .select("id,name,webUrl,size,eTag,createdDateTime,lastModifiedDateTime,folder,file,parentReference")
-        .top(200)
-        .get();
+      try {
 
-      while (true) {
+        let response = await this.safeApiCall(() =>
+          this.client
+            .api(`/sites/${siteId}/drives/${driveId}/items/${folderId}/children`)
+            .select("id,name,webUrl,size,eTag,createdDateTime,lastModifiedDateTime,folder,file,parentReference")
+            .top(200)
+            .get()
+        );
 
-        for (const item of response.value) {
+        while (response) {
 
-          // If folder → traverse deeper
-          if (item.folder) {
-            stack.push(item.id);
+          for (const item of response.value || []) {
+
+            // Traverse folders
+            if (item.folder) {
+              stack.push(item.id);
+            }
+
+            // Process files
+            if (
+              item.file &&
+              this.isAcceptedExtension(item.name, acceptedExtensions) &&
+              (
+                !filterISO || // Full sync
+                (
+                  item.lastModifiedDateTime &&
+                  item.lastModifiedDateTime > filterISO
+                )
+              )
+            ) {
+              results.push(this.mapToMeta(item));
+            }
           }
 
-          // If file → apply extension + date filter
-          if (
-            item.file &&
-            this.isAcceptedExtension(item.name, acceptedExtensions) &&
-            (!filterISO ||
-              (item.lastModifiedDateTime &&
-               item.lastModifiedDateTime > filterISO))
-          ) {
-            results.push(this.mapToMeta(item));
-          }
+          if (!response["@odata.nextLink"]) break;
+
+          response = await this.safeApiCall(() =>
+            this.client.api(response["@odata.nextLink"]).get()
+          );
         }
 
-        if (!response["@odata.nextLink"]) break;
-
-        response = await this.client
-          .api(response["@odata.nextLink"])
-          .get();
+      } catch (folderError) {
+        console.error(`Folder failed: ${folderId}`, folderError);
+        continue; // isolate folder failure
       }
     }
 
@@ -138,7 +173,44 @@ export class SharePointGraphService {
   }
 
   // =====================================================
-  // EXTENSION NORMALIZER
+  // SAFE API CALL WITH RETRY
+  // =====================================================
+  private async safeApiCall<T>(
+    fn: () => Promise<T>,
+    retries = 3,
+    delayMs = 1000,
+  ): Promise<T> {
+
+    try {
+      return await fn();
+    } catch (error: any) {
+
+      const status = error?.statusCode || error?.status;
+
+      if (
+        retries > 0 &&
+        (status === 429 || status >= 500)
+      ) {
+        const retryAfter =
+          Number(error?.headers?.["retry-after"]) || 1;
+
+        const backoff = delayMs * Math.pow(2, 3 - retries);
+
+        await this.sleep(retryAfter * 1000 || backoff);
+
+        return this.safeApiCall(fn, retries - 1, delayMs);
+      }
+
+      throw error;
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // =====================================================
+  // EXTENSION HELPERS
   // =====================================================
   private normalizeExtensions(extensions: string[]): string[] {
     if (!extensions || extensions.length === 0) return [];
@@ -149,9 +221,6 @@ export class SharePointGraphService {
     });
   }
 
-  // =====================================================
-  // EXTENSION CHECK
-  // =====================================================
   private isAcceptedExtension(
     fileName?: string,
     acceptedExtensions?: string[],
@@ -162,31 +231,29 @@ export class SharePointGraphService {
     if (!acceptedExtensions || acceptedExtensions.length === 0)
       return true;
 
-    const lowerName = fileName.toLowerCase();
+    const lower = fileName.toLowerCase();
 
     return acceptedExtensions.some(ext =>
-      lowerName.endsWith(ext),
+      lower.endsWith(ext),
     );
   }
 
   // =====================================================
-  // ETAG VERSION EXTRACTOR
+  // ETAG VERSION
   // =====================================================
   private extractVersionFromEtag(eTag?: string): number | null {
     if (!eTag) return null;
 
     const cleaned = eTag.replace(/"/g, "");
     const parts = cleaned.split(",");
-
     const versionPart = parts.length > 1 ? parts[1] : parts[0];
-
     const version = Number(versionPart);
 
     return isNaN(version) ? null : version;
   }
 
   // =====================================================
-  // MAP RESPONSE
+  // MAP
   // =====================================================
   private mapToMeta(item: any): SharePointFileMeta {
     return {
