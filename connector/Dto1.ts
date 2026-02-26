@@ -1,0 +1,76 @@
+import {
+  IsString,
+  
+  IsOptional,
+  IsEnum,
+  IsObject,
+  IsInt,
+  Min,
+  Max,
+  IsArray,
+  ValidateNested,
+} from 'class-validator';
+import { ApiProperty } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+
+export enum HttpMethod {
+  GET = 'GET',
+  POST = 'POST',
+}
+
+export class SortFieldDto {
+  @ApiProperty({ example: 'deadline' })
+  @IsString()
+  field: string;
+
+  @ApiProperty({ example: 'asc' })
+  @IsEnum(['asc', 'desc'])
+  direction: 'asc' | 'desc';
+}
+
+export class GenericWrapperDto {
+  @ApiProperty({ example: 'https://api.example.com/data' })
+  @IsString()
+  url: string;
+
+  @ApiProperty({ enum: HttpMethod })
+  @IsEnum(HttpMethod)
+  method: HttpMethod;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsObject()
+  queryParams?: Record<string, any>;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsObject()
+  payload?: any;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsObject()
+  headers?: Record<string, string>;
+
+  @ApiProperty({ required: false, type: [SortFieldDto] })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => SortFieldDto)
+  sortBy?: SortFieldDto[];
+
+  @ApiProperty({ required: false, default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiProperty({ required: false, default: 10 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(1000)
+  limit?: number = 10;
+}
