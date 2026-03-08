@@ -1,0 +1,17 @@
+<div class="message-text assistant" [innerHTML]="message.response"></div>
+
+<div class="feedback">
+  <button
+    (click)="sendFeedback(message.id, 'up')"
+    [class.active]="message.feedback === 'up'"
+  >
+    👍
+  </button>
+
+  <button
+    (click)="sendFeedback(message.id, 'down')"
+    [class.active]="message.feedback === 'down'"
+  >
+    👎
+  </button>
+</div>
