@@ -12,6 +12,25 @@ handleClick(event: any) {
   }
 }
 
+renderMarkdown(md: string): string {
+
+  let html = marked.parse(md) as string;
+
+  // links new tab
+  html = html.replace(
+    /<a /g,
+    '<a target="_blank" rel="noopener noreferrer" '
+  );
+
+  // add copy button to li
+  html = html.replace(
+    /<li>/g,
+    '<li><button class="copy-li">Copy</button>'
+  );
+
+  return html;
+}
+
 handleClick(event: any) {
 
   if (event.target.classList.contains('copy-li')) {
