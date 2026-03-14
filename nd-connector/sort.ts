@@ -3,8 +3,13 @@ import { Injectable } from '@nestjs/common';
 @Injectable()
 export class TaskService {
 
-  private parseDDMMYYYY(dateStr: string): Date {
-    const [day, month, year] = dateStr.split('/').map(Number);
+  private parseDDMMYYYY(dateStr?: string): Date | null {
+    if (!dateStr) return null;
+
+    const parts = dateStr.split('/');
+    if (parts.length !== 3) return null;
+
+    const [day, month, year] = parts.map(Number);
     return new Date(year, month - 1, day);
   }
 
@@ -12,8 +17,12 @@ export class TaskService {
     return data.sort((a, b) => {
       const dateA = this.parseDDMMYYYY(a.stepDeadLine);
       const dateB = this.parseDDMMYYYY(b.stepDeadLine);
-      return dateA.getTime() - dateB.getTime(); // ascending
+
+      if (!dateA && !dateB) return 0;
+      if (!dateA) return 1;   // null values go last
+      if (!dateB) return -1;
+
+      return dateA.getTime() - dateB.getTime();
     });
   }
-
 }
